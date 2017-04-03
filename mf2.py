@@ -1,9 +1,11 @@
+import base64
 from cStringIO import StringIO
 from gzip import GzipFile
 import re
+import sys
 import urlparse
 
-from mrjob.protocol import RawProtocol
+from mrjob.protocol import RawProtocol,  RawValueProtocol
 import warc
 
 from mrcc import CCJob
@@ -27,57 +29,43 @@ class ExtractMf2(CCJob):
   INTERNAL_PROTOCOL = RawProtocol
   OUTPUT_PROTOCOL = RawProtocol
 
-  # in-progress request and response record in process_record()
-  request = None
-  response = None
-
   def process_record(self, record):
-    type = record['WARC-Type']
-
-    if type == 'warcinfo':
+    if record['WARC-Type'] != 'response':
       return
-    elif type == 'request':
-      self.request = record
-      return
-    elif type == 'response':
-      self.response = record
-      return
-
-    assert type == 'metadata' and self.request and self.response
 
     # The HTTP response is defined by a specification: first part is headers
     # (metadata) and then following two CRLFs (newlines) has the response
-    payload = self.response.payload.read()
-    headers, body = payload.split('\r\n\r\n', 1)
-    if 'Content-Type: text/html' in headers:
-        # if MF2_CLASS_RE.search(body):
+    payload = record.payload.read()
+
+    http_headers, body = payload.split('\r\n\r\n', 1)
+    if 'Content-Type: text/html' in http_headers and body.strip():
+      if MF2_CLASS_RE.search(body):
         warcstr = StringIO()
-        warcfile = warc.WARCFile(fileobj=GzipFile(fileobj=warcstr, mode='w'))
-        warcfile.write_record(self.request)
-        warcfile.write_record(self.response)
-        warcfile.write_record(record)  # metadata
-        warcfile.close()
+        warcfile = warc.WARCFile(fileobj=warcstr, mode='w')
+        warcfile.write_record(warc.WARCRecord(payload=payload, header=record.header))
 
         domain = urlparse.urlparse(record['WARC-Target-URI']).netloc
         # domain = headers['Host']
-        warcbuf = warcstr.getvalue()
-        warcstr.close()
+        warcbuf = base64.b64encode(warcstr.getvalue())
+        warcfile.close()
+        print '@', `domain`, len(warcbuf)
         yield domain, warcbuf
 
-    self.request = self.response = None
-
   def combiner(self, key, values):
-    for value in values:
-      yield key, value
+    yield key, base64.b64encode(''.join(base64.b64decode(v) for v in values))
 
   def reducer(self, key, values):
-    # print '@', `key`
-    out = warc.open(u'/tmp/out.warc.gz', 'w')
+    out = warc.open(u'/tmp/%s.warc.gz' % key, 'w')
     for value in values:
-      if value:
-        for record in warc.WARCFile(fileobj=GzipFile(fileobj=StringIO(value))):
-          out.write_record(record)
+      value = base64.b64decode(value)
+      if value and value.strip():
+        for record in warc.WARCFile(fileobj=StringIO(value)):
+          # out.write_record(record)
+          out.write_record(warc.WARCRecord(payload=record.payload.read(),
+                                           header=record.header))
     out.close()
+
+STATE: try skipping warc lib and just process text directly
 
 
 if __name__ == '__main__':
